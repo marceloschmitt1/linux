@@ -1,7 +1,6 @@
 /dts-v1/;
 
 /include/ "zynq-zed.dtsi"
-/include/ "zynq-zed-adv7511.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 
 / {
@@ -128,12 +127,22 @@
 		};
 	};
 
+	axi_hdmi_clkgen: axi-clkgen@79000000 {
+		compatible = "adi,axi-clkgen-2.00.a";
+		reg = <0x79000000 0x10000>;
+		#clock-cells = <0>;
+		clocks = <&clkc 16>;
+	};
+
 	imageon_bridge {
 		compatible = "adi,imageon-v4l2-bridge-1.00.a";
-
 		interrupt-parent = <&gpio0>;
 		interrupts = <86 0>;
-
+		memory-region = <&reserved>;
+		reg = <0x70e00000 0x10000>, <0x43100000 0x10000>;
+		reg-names = "tx_hdmi", "rx_hdmi";
+		clocks = <&axi_hdmi_clkgen 0>;
+		clock-names = "hdmi_clk";
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -152,5 +161,28 @@
 			    };
 			};
 		};
+	};
+
+	adi-fb {
+		compatible = "adi,framebuffer-0.00.a";
+		memory-region = <&reserved>;
+		reg = <0x43000000 0x1000>, <0x43c20000 0x1000>;
+		reg-names = "tx_dma", "rx_dma";
+		flock,resolution = <1920>, <1080>;
+		flock,distance = <0>;
+		flock,mode = <0>;
+		flock,dwidth = <4>;
+		flock,frm-buf-nr = <3>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		reserved: buffer@0 {
+			no-map;
+			reg = <0x1C000000 0x2000000>;
+			};
 	};
 };
