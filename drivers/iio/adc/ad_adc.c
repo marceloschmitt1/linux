@@ -25,6 +25,8 @@
 #define ADI_REG_CORRECTION_COEFFICIENT(x) (0x4c + (x) * 4)
 
 struct adc_chip_info {
+	const char *name;
+	int (*special_probe) (struct platform_device *pdev);
 	bool has_frontend;
 	const struct iio_chan_spec *channels;
 	unsigned int num_channels;
@@ -67,6 +69,8 @@ static const struct iio_chan_spec cn0363_channels[] = {
 };
 
 static const struct adc_chip_info cn0363_chip_info = {
+	.name = "cn0363",
+	.special_probe = NULL,
 	.has_frontend = true,
 	.channels = cn0363_channels,
 	.num_channels = ARRAY_SIZE(cn0363_channels),
@@ -89,6 +93,8 @@ static const struct adc_chip_info cn0363_chip_info = {
 		.endianness = IIO_LE, \
 	}, \
 }
+
+static int axiadc_m2k_special_probe(struct platform_device *pdev);
 
 static const char * const m2k_samp_freq_available[] = {
 	"1000",
@@ -183,6 +189,8 @@ static const struct iio_chan_spec ad9371_obs_rx_channels[] = {
 };
 
 static const struct adc_chip_info ad9371_obs_rx_chip_info = {
+	.name = "ad9371_obs_rx",
+	.special_probe = NULL,
 	.channels = ad9371_obs_rx_channels,
 	.num_channels = ARRAY_SIZE(ad9371_obs_rx_channels),
 	.ctrl_flags = ADI_FORMAT_SIGNEXT | ADI_FORMAT_ENABLE,
@@ -194,6 +202,8 @@ static const struct iio_chan_spec m2k_adc_channels[] = {
 };
 
 static const struct adc_chip_info m2k_adc_chip_info = {
+	.name = "m2k_adc",
+	.special_probe = axiadc_m2k_special_probe,
 	.channels = m2k_adc_channels,
 	.num_channels = ARRAY_SIZE(m2k_adc_channels),
 	.ctrl_flags = ADI_FORMAT_SIGNEXT | ADI_FORMAT_ENABLE,
@@ -361,6 +371,42 @@ static int axiadc_read_raw(struct iio_dev *indio_dev,
 	return -EINVAL;
 }
 
+static int axiadc_m2k_special_probe(struct platform_device *pdev)
+{
+	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
+	struct axiadc_state *st = iio_priv(indio_dev);
+	struct resource *mem;
+	int i;
+
+	mem = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (mem) {
+		unsigned int val;
+
+		st->slave_regs = devm_ioremap_resource(&pdev->dev, mem);
+		if (IS_ERR(st->slave_regs))
+			return PTR_ERR(st->slave_regs);
+
+		val = cf_axi_dds_to_signed_mag_fmt(1, 0);
+		iowrite32(val, st->slave_regs +
+			  ADI_REG_CORRECTION_COEFFICIENT(0));
+		iowrite32(val, st->slave_regs +
+			  ADI_REG_CORRECTION_COEFFICIENT(1));
+	}
+
+	for (i = 0; i < indio_dev->num_channels; i++) {
+		if (indio_dev->channels[i].info_mask_separate &
+			BIT(IIO_CHAN_INFO_CALIBSCALE)) {
+			unsigned int chan = indio_dev->channels[i].channel;
+			iowrite32(0x40000000, st->regs +
+				  ADI_REG_CHAN_CNTRL_2(chan));
+			iowrite32(ADI_IQCOR_ENB, st->regs +
+				  ADI_REG_CHAN_CNTRL(chan));
+		}
+	}
+
+	return 0;
+}
+
 static int axiadc_write_raw(struct iio_dev *indio_dev,
 	const struct iio_chan_spec *chan, int val, int val2, long info)
 {
@@ -460,13 +506,20 @@ static int adc_probe(struct platform_device *pdev)
 	struct iio_dev *indio_dev;
 	struct axiadc_state *st;
 	struct resource *mem;
-	unsigned int i;
 	int ret;
 
 	id = of_match_node(adc_of_match, pdev->dev.of_node);
 	if (!id)
 		return -ENODEV;
+
 	info = id->data;
+
+	/* info must provide a name */
+	if (!info->name) {
+		dev_err(&pdev->dev,
+			"A valid name must be given for the chip info");
+		return -ENODATA;
+	}
 
 	indio_dev = devm_iio_device_alloc(&pdev->dev, sizeof(*st));
 	if (indio_dev == NULL)
@@ -475,7 +528,8 @@ static int adc_probe(struct platform_device *pdev)
 	st = iio_priv(indio_dev);
 
 	st->clk = devm_clk_get(&pdev->dev, "sampl_clk");
-	if (IS_ERR(st->clk)) {
+	/* m2k is an exception... */
+	if (IS_ERR(st->clk) && strcmp(info->name, "m2k_adc")) {
 		return PTR_ERR(st->clk);
 	} else {
 		ret = clk_prepare_enable(st->clk);
@@ -488,22 +542,7 @@ static int adc_probe(struct platform_device *pdev)
 	if (IS_ERR(st->regs))
 		return PTR_ERR(st->regs);
 
-	mem = platform_get_resource(pdev, IORESOURCE_MEM, 1);
-	if (mem) {
-		unsigned int val;
-
-		st->slave_regs = devm_ioremap_resource(&pdev->dev, mem);
-		if (IS_ERR(st->slave_regs))
-			return PTR_ERR(st->slave_regs);
-
-		val = cf_axi_dds_to_signed_mag_fmt(1, 0);
-		iowrite32(val, st->slave_regs + ADI_REG_CORRECTION_COEFFICIENT(0));
-		iowrite32(val, st->slave_regs + ADI_REG_CORRECTION_COEFFICIENT(1));
-	}
-
 	platform_set_drvdata(pdev, indio_dev);
-
-
 
 	indio_dev->dev.parent = &pdev->dev;
 	indio_dev->name = pdev->dev.of_node->name;
@@ -532,14 +571,11 @@ static int adc_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_free_frontend;
 
-	/* m2k specific*/
-	for (i = 0; i < indio_dev->num_channels; i++) {
-		if (indio_dev->channels[i].info_mask_separate &
-			BIT(IIO_CHAN_INFO_CALIBSCALE)) {
-			unsigned int chan = indio_dev->channels[i].channel;
-			iowrite32(0x40000000, st->regs + ADI_REG_CHAN_CNTRL_2(chan));
-			iowrite32(ADI_IQCOR_ENB, st->regs + ADI_REG_CHAN_CNTRL(chan));
-		}
+	/* handle special probe */
+	if (info->special_probe) {
+		ret = info->special_probe(pdev);
+		if (ret)
+			goto err_unconfigure_ring;
 	}
 
 	ret = iio_device_register(indio_dev);
