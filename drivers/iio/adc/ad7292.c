@@ -7,11 +7,16 @@
 
 #include <linux/bitfield.h>
 #include <linux/device.h>
+#include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/regulator/consumer.h>
 #include <linux/spi/spi.h>
 
+#include <linux/iio/buffer.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/triggered_buffer.h>
+#include <linux/iio/trigger_consumer.h>
 
 #define ADI_VENDOR_ID 0x0018
 
@@ -22,15 +27,22 @@
 #define AD7292_REG_ADC_CH(x)		(0x10 + (x))
 
 /* AD7292 configuration bank subregisters definition */
+#define AD7292_BANK_REG_OUT_DRV		0x01
 #define AD7292_BANK_REG_VIN_RNG0	0x10
 #define AD7292_BANK_REG_VIN_RNG1	0x11
 #define AD7292_BANK_REG_SAMP_MODE	0x12
 
 #define AD7292_RD_FLAG_MSK(x)		(BIT(7) | ((x) & 0x3F))
+#define AD7292_WR_FLAG_MSK(x)		(BIT(6) | ((x) & 0x3F))
 
 /* AD7292_REG_ADC_CONVERSION */
 #define AD7292_ADC_DATA_MASK		GENMASK(15, 6)
-#define AD7292_ADC_DATA(x)		FIELD_GET(AD7292_ADC_DATA_MASK, x)
+#define AD7292_ADC_DATA(x)		FIELD_GET(AD7292_ADC_DATA_MASK, (x))
+
+/* AD7292_BANK_REG_OUT_DRV */
+#define AD7292_OUT_DRV_MASK		GENMASK(11, 0)
+#define AD7292_OUT_DRV(x)		FIELD_PREP(AD7292_OUT_DRV_MASK, (x))
+
 
 /* AD7292_CHANNEL_SAMPLING_MODE */
 #define AD7292_CH_SAMP_MODE(reg, ch)	(((reg) >> 8) & BIT(ch))
@@ -45,6 +57,14 @@
 			      BIT(IIO_CHAN_INFO_SCALE),			\
 	.indexed = 1,							\
 	.channel = _chan,						\
+	.scan_index = _chan,						\
+	.scan_type = {							\
+		.sign = 'u',						\
+		.realbits = 10,						\
+		.storagebits = 16,					\
+		.shift = 6,						\
+		.endianness = IIO_LE,					\
+	},								\
 }
 
 static const struct iio_chan_spec ad7292_channels[] = {
@@ -79,9 +99,12 @@ struct ad7292_state {
 	struct spi_device *spi;
 	struct regulator *reg;
 	unsigned short vref_mv;
+	struct iio_trigger *trig;
+	struct mutex lock;
+	int curr_ch;
 
 	__be16 d16 ____cacheline_aligned;
-	u8 d8[2];
+	u8 d8[4];
 };
 
 static int ad7292_spi_reg_read(struct ad7292_state *st, unsigned int addr)
@@ -111,6 +134,68 @@ static int ad7292_spi_subreg_read(struct ad7292_state *st, unsigned int addr,
 		return ret;
 
 	return (be16_to_cpu(st->d16) >> shift);
+}
+
+static int ad7292_spi_subreg_write(struct ad7292_state *st, unsigned int addr,
+				   unsigned int sub_addr, unsigned int val)
+{
+	st->d8[0] = AD7292_WR_FLAG_MSK(addr);
+	st->d8[1] = sub_addr;
+	st->d8[2] = (val & 0xFF00) >> 8;
+	st->d8[3] = val & 0x00FF;
+	//dev_dbg(&st->spi->dev, "subreg_write: d8 buffer: 0x%x %x %x %x\n",
+	//	st->d8[0], st->d8[1], st->d8[2], st->d8[3]);
+	return spi_write(st->spi, st->d8, 4);
+}
+
+//TODO do not submit this function
+static int ad7292_read_out_bank(struct ad7292_state *st)
+{
+	int regval;
+
+	mutex_lock(&st->lock);
+	regval = ad7292_spi_subreg_read(st, AD7292_REG_CONF_BANK,
+					AD7292_BANK_REG_OUT_DRV, 2);
+	if (regval < 0)
+		goto err_unlock;
+
+	regval = FIELD_GET(AD7292_OUT_DRV_MASK, regval);
+
+err_unlock:
+	mutex_unlock(&st->lock);
+	if (regval < 0)
+		dev_dbg(&st->spi->dev, "ad7292 ERROR read_out_bank\n");
+	dev_dbg(&st->spi->dev, "read_out_bank: conf_bank io_driv 0x%03x\n",
+		regval);
+	return regval;
+}
+
+static int ad7292_enable_gpio(struct ad7292_state *st, int gpio_nr, bool enable)
+{
+	int regval;
+
+	mutex_lock(&st->lock);
+	regval = ad7292_spi_subreg_read(st, AD7292_REG_CONF_BANK,
+					AD7292_BANK_REG_OUT_DRV, 2);
+	if (regval < 0)
+		goto err_unlock;
+
+	//dev_dbg(&st->spi->dev, "enable_gpio: conf_bank io_driv 0x%03x\n", regval);
+
+	regval &= ~BIT(gpio_nr);
+	if (enable)
+		regval |= AD7292_OUT_DRV(BIT(gpio_nr));
+
+	dev_dbg(&st->spi->dev, "enable_gpio: set conf_bank io_driv to 0x%03x\n",
+		regval);
+
+	regval = ad7292_spi_subreg_write(st, AD7292_REG_CONF_BANK,
+					 AD7292_BANK_REG_OUT_DRV, regval);
+
+err_unlock:
+	mutex_unlock(&st->lock);
+
+	return regval;
 }
 
 static int ad7292_single_conversion(struct ad7292_state *st,
@@ -205,6 +290,13 @@ static int ad7292_read_raw(struct iio_dev *indio_dev,
 	unsigned int ch_addr;
 	int ret;
 
+	if (indio_dev->currentmode & INDIO_BUFFER_TRIGGERED)
+		dev_dbg(&st->spi->dev, "read_raw: trigg mode");
+	else
+		dev_dbg(&st->spi->dev, "read_raw: direct mode");
+
+	ad7292_read_out_bank(st);
+
 	switch (info) {
 	case IIO_CHAN_INFO_RAW:
 		ch_addr = AD7292_REG_ADC_CH(chan->channel);
@@ -241,7 +333,237 @@ static int ad7292_read_raw(struct iio_dev *indio_dev,
 	return -EINVAL;
 }
 
+static irqreturn_t ad7292_trigger_handler(int irq, void *p)
+{
+	struct iio_poll_func *pf = p;
+	struct iio_dev *indio_dev = pf->indio_dev;
+	struct ad7292_state *st = iio_priv(indio_dev);
+	unsigned short data[5]; /* 16-bit sample + 64-bit timestamp */
+	struct spi_transfer t[] = {
+		{
+			.rx_buf = &st->d16,
+			.len = 2,
+			.cs_change = 1
+		}
+	};
+	int ret;
+
+	//dev_dbg(&st->spi->dev, "trigger_handler %d: irq  %d", irq, irq);
+	dev_dbg(&st->spi->dev, "trigger_handler %d: pf->irq  %d", irq, pf->irq);
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "trigger_handler %d: gpiod_get_raw_value ret: %d",
+		irq, ret);
+
+	mutex_lock(&st->lock);
+
+	ret = spi_sync_transfer(st->spi, t, ARRAY_SIZE(t));
+	if (ret < 0)
+		goto err_unlock;
+
+	data[0] = AD7292_ADC_DATA(be16_to_cpu(st->d16));
+
+	dev_dbg(&st->spi->dev, "trigger_handler %d: data[0..4]: %u, %u, %u, %u, %u",
+		irq, data[0], data[1], data[2], data[3], data[4]);
+	dev_dbg(&st->spi->dev, "trigger_handler %d: indio_dev->scan_timestamp: %d\n",
+		irq, indio_dev->scan_timestamp);
+
+//    u16 buf[8];
+//    int i = 0;
+//
+//    /* read data for each active channel */
+//    for_each_set_bit(bit, active_scan_mask, masklength)
+//        buf[i++] = sensor_get_data(bit)
+//
+//    iio_push_to_buffers_with_timestamp(indio_dev, buf, timestamp);
+//
+//    iio_trigger_notify_done(trigger);
+//    return IRQ_HANDLED;
+
+//	mutex_lock(&st->lock);
+//	for_each_set_bit(i, indio_dev->active_scan_mask, indio_dev->masklength) {
+//		val = (sample[1] << 8) + sample[0];
+//
+//		chan = iio_find_channel_from_si(indio_dev, i);
+//		ret = st->write(st, AD5686_CMD_WRITE_INPUT_N_UPDATE_N,
+//				chan->address, val << chan->scan_type.shift);
+//	}
+//	mutex_unlock(&st->lock);
+
+
+	//iio_push_to_buffers_with_timestamp(indio_dev, data,
+	//				   iio_get_time_ns(indio_dev));
+	iio_push_to_buffers(indio_dev, data);
+
+err_unlock:
+	mutex_unlock(&st->lock);
+
+	iio_trigger_notify_done(indio_dev->trig);
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "trigger_handler %d: gpiod_get_raw_value ret: %d",
+		irq, ret);
+	if (ret < 0)
+		return ret;
+	dev_dbg(&st->spi->dev, "trigger_handler %d: return", irq);
+
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t ad7292_interrupt(int irq, void *dev_id)
+{
+	struct iio_dev *indio_dev = dev_id;
+	struct ad7292_state *st = iio_priv(indio_dev);
+	int ret;
+
+	dev_dbg(&st->spi->dev, "interrupt %d:", irq);
+	dev_dbg(&st->spi->dev, "interrupt %d: buf_en: %d",
+		irq, iio_buffer_enabled(indio_dev));
+	dev_dbg(&st->spi->dev, "interrupt %d: trig base: %d",
+		irq, st->trig->subirq_base);
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "interrupt %d: gpiod_get_raw_value ret: %d",
+		irq, ret);
+
+	if (iio_buffer_enabled(indio_dev))
+		iio_trigger_poll(st->trig);
+
+	return IRQ_HANDLED;
+};
+
+
+static int ad7292_buffer_preenable(struct iio_dev *indio_dev)
+{
+	struct ad7292_state *st = iio_priv(indio_dev);
+	int ret;
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "preenable: gpiod_get_raw_value ret: %d", ret);
+
+	ret = ad7292_enable_gpio(st, 6, 1);
+	dev_dbg(&st->spi->dev, "preenable: enable BUSY ret: %d", ret);
+	//ret = ad7292_read_out_bank(st);
+
+	/* Continuous capture mode keeping CS active */
+	dev_dbg(&st->spi->dev, "preenable: activate CS");
+	gpiod_set_value(st->spi->cs_gpiod, 1);
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "preenable: gpiod_get_raw_value ret: %d", ret);
+
+	return 0;
+}
+
+static int ad7292_buffer_postenable(struct iio_dev *indio_dev)
+{
+	struct ad7292_state *st = iio_priv(indio_dev);
+	struct spi_transfer t[] = {
+		{
+			.tx_buf = &st->d8,
+			.len = 2,
+			.cs_change = 1
+		}
+	};
+	int ret;
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "postenable: gpiod_get_raw_value ret: %d", ret);
+
+	iio_triggered_buffer_postenable(indio_dev); //TODO remove - Lars' patch
+
+	dev_dbg(&st->spi->dev, "postenable: Issue conversion command");
+
+	/* AD7292 enters in conversion mode after the issue of a conversion command */
+	st->d8[0] = AD7292_REG_ADC_CH(3); // TODO Using analog channel 3 for test
+	st->d8[1] = AD7292_RD_FLAG_MSK(AD7292_REG_CONV_COMM);
+	ret = spi_sync_transfer(st->spi, t, ARRAY_SIZE(t));
+	if (ret < 0)
+		return ret;
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "postenable: gpiod_get_raw_value ret: %d", ret);
+
+	return 0;
+}
+
+static int ad7292_buffer_predisable(struct iio_dev *indio_dev)
+{
+	struct ad7292_state *st = iio_priv(indio_dev);
+
+	dev_dbg(&st->spi->dev, "predisable: start/end");
+
+	return iio_triggered_buffer_predisable(indio_dev); //TODO return 0 - Lars' patch
+}
+
+int ad7292_buffer_postdisable(struct iio_dev *indio_dev)
+{
+	struct ad7292_state *st = iio_priv(indio_dev);
+	int ret;
+
+	//TODO check BUSY pin before pulling CS high?
+	//From datasheet: CS line must remain low while the ADC conversion is
+	//in progress to prevent possible corruption of the ADC result.
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "postdisable: gpiod_get_raw_value ret: %d", ret);
+
+	dev_dbg(&st->spi->dev, "postdisable: pull CS up");
+	/* Disable CS */
+	gpiod_set_value(st->spi->cs_gpiod, 0);
+
+	ret = gpiod_get_raw_value(st->spi->cs_gpiod);
+	dev_dbg(&st->spi->dev, "postdisable: gpiod_get_raw_value ret: %d", ret);
+
+	dev_dbg(&st->spi->dev, "postdisable: disable gpio");
+	ret = ad7292_enable_gpio(st, 6, 0);
+
+	return 0;
+}
+
+/**
+ * TODO
+ * I'm not sure where/when to enable/disable the gpio for BUSY pin.
+ * I've been experimenting with setup_ops but still don't have a clear answer for it.
+ */
+static const struct iio_buffer_setup_ops ad7292_buffer_ops = {
+	.preenable = &ad7292_buffer_preenable,
+	.postenable = &ad7292_buffer_postenable,
+	.predisable = &ad7292_buffer_predisable,
+	.postdisable = &ad7292_buffer_postdisable
+};
+
+static int ad7292_trig_set_state(struct iio_trigger *trig, bool state)
+{
+	struct iio_dev *indio_dev = iio_trigger_get_drvdata(trig);
+	struct ad7292_state *st = iio_priv(indio_dev);
+	int regval;
+
+	regval = ad7292_spi_subreg_read(st, AD7292_REG_CONF_BANK,
+					AD7292_BANK_REG_OUT_DRV, 2);
+	if (regval < 0)
+		return regval;
+
+	return FIELD_GET(BIT(6), regval);
+}
+
+static int ad7292_validate_trigger(struct iio_dev *indio_dev,
+				   struct iio_trigger *trig)
+{
+	struct ad7292_state *st = iio_priv(indio_dev);
+
+	if (st->trig != trig)
+		return -EINVAL;
+
+	return 0;
+}
+
+static const struct iio_trigger_ops ad7292_trigger_ops = {
+	.validate_device = iio_trigger_validate_own_device,
+	.set_trigger_state = &ad7292_trig_set_state,
+};
+
 static const struct iio_info ad7292_info = {
+	.validate_trigger = &ad7292_validate_trigger,
 	.read_raw = ad7292_read_raw,
 };
 
@@ -274,6 +596,7 @@ static int ad7292_probe(struct spi_device *spi)
 	}
 
 	spi_set_drvdata(spi, indio_dev);
+	mutex_init(&st->lock);
 
 	st->reg = devm_regulator_get_optional(&spi->dev, "vref");
 	if (!IS_ERR(st->reg)) {
@@ -319,6 +642,37 @@ static int ad7292_probe(struct spi_device *spi)
 		indio_dev->num_channels = ARRAY_SIZE(ad7292_channels);
 		indio_dev->channels = ad7292_channels;
 	}
+
+	st->trig = devm_iio_trigger_alloc(&spi->dev, "%s-dev%d",
+					  indio_dev->name, indio_dev->id);
+	if (!st->trig)
+		return -ENOMEM;
+
+	st->trig->ops = &ad7292_trigger_ops;
+	st->trig->dev.parent = &spi->dev;
+	iio_trigger_set_drvdata(st->trig, indio_dev);
+	ret = devm_iio_trigger_register(&spi->dev, st->trig);
+	if (ret)
+		return ret;
+
+	indio_dev->trig = iio_trigger_get(st->trig);
+
+	dev_dbg(&spi->dev, "probe spi->irq: %d\n", spi->irq);
+	ad7292_read_out_bank(st);
+	// I may use iio_trigger_generic_data_rdy_poll istead of ad7292_interrupt
+	ret = devm_request_irq(&spi->dev, spi->irq,
+			       &ad7292_interrupt,
+			       IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+			       indio_dev->name, indio_dev);
+	if (ret)
+		return ret;
+
+	ret = devm_iio_triggered_buffer_setup(&spi->dev, indio_dev,
+					      &iio_pollfunc_store_time,
+					      &ad7292_trigger_handler,
+					      &ad7292_buffer_ops);
+	if (ret)
+		return ret;
 
 	return devm_iio_device_register(&spi->dev, indio_dev);
 }
